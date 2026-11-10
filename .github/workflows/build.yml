@@ -1,0 +1,104 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Vérifier les liens du catalogue de modèles
+        continue-on-error: true
+        run: |
+          python3 - <<'PYEOF'
+          import json, urllib.request
+          for m in json.load(open('app/src/main/assets/catalog.json')):
+              try:
+                  r = urllib.request.urlopen(urllib.request.Request(m['url'], method='HEAD'), timeout=30)
+                  print('OK ', r.status, m['id'])
+              except Exception as e:
+                  print('::warning::Lien cassé pour', m['id'], e)
+          PYEOF
+
+      - name: Installer NDK + CMake (SDK Android déjà présent sur le runner)
+        run: |
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          echo "SDK Android : $SDK"
+          SM=$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n1 || true)
+          if [ -z "$SM" ]; then SM=$(find "$SDK" -name sdkmanager -type f 2>/dev/null | head -n1); fi
+          echo "sdkmanager : $SM"
+          test -x "$SM"
+          yes | "$SM" --sdk_root="$SDK" --licenses > /dev/null || true
+          "$SM" --sdk_root="$SDK" "platforms;android-34" "build-tools;34.0.0" "ndk;26.3.11579264" "cmake;3.22.1"
+          echo "NDK=$SDK/ndk/26.3.11579264" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$SDK" >> $GITHUB_ENV
+
+      - name: Cache des moteurs natifs
+        id: native
+        uses: actions/cache@v4
+        with:
+          path: app/src/main/jniLibs
+          key: native-v3-moteurs
+
+      - name: Compiler llama.cpp (serveur de chat) pour Android arm64
+        if: steps.native.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp
+          cmake -S llama.cpp -B build-llama \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_OPENMP=OFF -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod \
+            -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=ON
+          cmake --build build-llama --target llama-server -j4
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          cp build-llama/bin/llama-server app/src/main/jniLibs/arm64-v8a/libllama_server.so
+
+      - name: Compiler stable-diffusion.cpp (génération d'images) pour Android arm64
+        if: steps.native.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --recursive https://github.com/leejet/stable-diffusion.cpp
+          cmake -S stable-diffusion.cpp -B build-sd \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_OPENMP=OFF -DGGML_NATIVE=OFF -DSD_BUILD_EXAMPLES=ON
+          cmake --build build-sd -j4
+          BIN=$(find build-sd -type f \( -name sd-cli -o -name sd \) -perm -u+x | head -n1)
+          echo "Binaire sd : $BIN"
+          cp "$BIN" app/src/main/jniLibs/arm64-v8a/libsd.so
+
+      - name: Ajouter proot (conteneur Linux léger, optionnel)
+        if: steps.native.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: |
+          # proot est récupéré depuis le dépôt Termux (paquet aarch64). Si l'étape échoue, l'APK
+          # fonctionne quand même : les moteurs tournent alors directement dans le bac à sable de l'appli.
+          BASE=https://packages.termux.dev/apt/termux-main
+          curl -fsSL $BASE/dists/stable/main/binary-aarch64/Packages -o Packages
+          FILE=$(awk '/^Package: proot$/{f=1} f&&/^Filename:/{print $2; exit}' Packages)
+          curl -fsSL $BASE/$FILE -o proot.deb
+          mkdir proot-x && cd proot-x && ar x ../proot.deb && tar xf data.tar.*
+          cp data/data/com.termux/files/usr/bin/proot ../app/src/main/jniLibs/arm64-v8a/libproot.so
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Compiler l'APK
+        run: gradle :app:assembleRelease --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Studo-apk
+          path: app/build/outputs/apk/release/*.apk
